@@ -19,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "httpserver.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <sstream>
@@ -43,6 +44,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "web/accessfile.h"
 #include "basic/fdbuf.h"
 #include "errorpage.h"
+
+static const size_t kMaxRequestLength = 1024 * 1024; // bytes
+static const size_t kMaxHeaderLine = 8192;
+static const size_t kMaxHeaderTotal = 64 * 1024;
 
 const char* HttpServer::HTTP_GET = "GET";
 const char* HttpServer::HTTP_POST = "POST";
@@ -155,6 +160,26 @@ interfaceAddresses(const char* if_name)
   }
   ::freeifaddrs(pAddr);
   return r;
+}
+
+std::istream&
+cappedGetline(std::istream& is, std::string& s, char delim, size_t maxLen)
+{
+  s.clear();
+  char c;
+  std::string temp;
+  if (is.get(c)) {
+    temp.push_back(c);
+    while (is.get(c) && c != delim && temp.length() < maxLen)
+      temp.push_back(c);
+    while (is && c != delim)
+      is.get(c);
+    if (!is.bad())
+      s = temp;
+    if (!is.bad() && is.eof())
+      is.clear(std::ios_base::eofbit);
+  }
+  return is;
 }
 
 } // namespace
@@ -386,7 +411,7 @@ struct HttpServer::Private
     fdbuf buf(fd);
     std::istream is(&buf);
     std::ostream os(&buf);
-    Request request(is);
+    Request request(is, kMaxRequestLength);
     Response response(os);
     if (!request.isValid()) {
       response.setStatus(HTTP_BAD_REQUEST);
@@ -722,17 +747,22 @@ HttpServer::Response::sendHeaders()
   return mpChunkstream ? *mpChunkstream : mStream;
 }
 
-HttpServer::Request::Request(std::istream& is)
+HttpServer::Request::Request(std::istream& is, int maxLength)
   : mStream(is)
   , mValid(true)
+  , mContentLength(-1)
 {
   std::string line;
-  if (std::getline(is, line)) {
+  if (cappedGetline(is, line, '\n', kMaxHeaderLine)) {
     if (!(std::istringstream(line) >> mMethod >> mUri >> mProtocol))
       mValid = false;
   }
-  while (mValid && std::getline(is, line) && line != "\r") {
-    if (line.empty())
+  size_t headerTotal = line.length();
+  while (mValid && cappedGetline(is, line, '\n', kMaxHeaderLine) && line != "\r") {
+    headerTotal += line.length();
+    if (headerTotal > kMaxHeaderTotal)
+      mValid = false;
+    else if (line.empty())
       mValid = false;
     else if (line.back() != '\r')
       mValid = false;
@@ -745,6 +775,15 @@ HttpServer::Request::Request(std::istream& is)
         auto value = ctrim(line.substr(pos + 1));
         mHeaders[key] = value;
       }
+    }
+  }
+  if (mHeaders.hasKey(HTTP_HEADER_CONTENT_LENGTH)) {
+    double length = mHeaders.getNumber(HTTP_HEADER_CONTENT_LENGTH);
+    if (std::isnan(length) || length > maxLength) {
+      mValid = false;
+    }
+    else {
+      mContentLength = length;
     }
   }
 }
@@ -774,7 +813,7 @@ HttpServer::Request::formData() const
   if (hasFormData() && mFormData.empty()) {
     std::istringstream iss(content());
     std::string entry;
-    while (std::getline(iss, entry, '&')) {
+    while (cappedGetline(iss, entry, '&', kMaxHeaderLine)) {
       size_t pos = entry.find('=');
       std::string key = entry.substr(0, pos);
       std::string value = pos < entry.length() ? entry.substr(pos + 1) : "";
@@ -782,14 +821,6 @@ HttpServer::Request::formData() const
     }
   }
   return mFormData;
-}
-
-int
-HttpServer::Request::contentLength() const
-{
-  return mHeaders.hasKey(HTTP_HEADER_CONTENT_LENGTH)
-           ? mHeaders.getNumber(HTTP_HEADER_CONTENT_LENGTH)
-           : -1;
 }
 
 std::ostream&
