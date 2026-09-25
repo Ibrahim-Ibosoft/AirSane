@@ -640,6 +640,14 @@ Scanner::Private::InputSource::init(const sanecpp::option_set& opt)
     mMaxPhysicalHeight = br_y.max();
   }
 
+  // Local patch (ev-pi, HP M1132): hpaio reports 381 mm height, but the
+  // platen only delivers A4 (297 mm). Clamp the advertised height so
+  // clients don't get a large blank area at the bottom.
+  if (unit == SANE_UNIT_MM) {
+    mMaxHeight = std::min(mMaxHeight, 297.0);
+    mMaxPhysicalHeight = std::min(mMaxPhysicalHeight, 297.0);
+  }
+
   // eSCL expresses sizes in terms of pixels at 300 dpi
   double f = 300;
   switch (unit) {
